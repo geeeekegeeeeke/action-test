@@ -1,0 +1,30 @@
+{
+  "name": "gitlab-ci-cd-sample",
+  "version": "1.0.0",
+  "description": "This is a sample project to demo a ci/cd flow",
+  "main": "src/app.js",
+  "author": "Diana",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@hapi/joi": "^15.1.1",
+    "@koa/cors": "2",
+    "koa": "^2.7.0",
+    "koa-404-handler": "^0.0.2",
+    "koa-better-error-handler": "^2.0.0",
+    "koa-bodyparser": "^4.2.1",
+    "koa-router": "^7.4.0",
+    "pino": "^5.13.2"
+  },
+  "scripts": {
+    "dev": "nodemon -r dotenv/config src/app.js | pino-pretty",
+    "test": "jest --setupFiles dotenv/config --coverage --detectOpenHandles --env node",
+    "start": "node src/app.js"
+  },
+  "devDependencies": {
+    "dotenv": "^8.0.0",
+    "jest": "^24.9.0",
+    "nodemon": "^1.19.1",
+    "pino-pretty": "^3.2.1",
+    "supertest": "^4.0.2"
+  }
+}

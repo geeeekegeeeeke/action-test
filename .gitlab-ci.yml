@@ -1,0 +1,1732 @@
+---
+:build:
+  :stage: build
+  :image: registry.gitlab.com/gitlab-org/cluster-integration/auto-build-image:v0.4.0
+  :variables:
+    :DOCKER_TLS_CERTDIR: ''
+  :services:
+  - docker:19.03.12-dind
+  :script:
+  - |
+    if [[ -z "$CI_COMMIT_TAG" ]]; then
+      export CI_APPLICATION_REPOSITORY=${CI_APPLICATION_REPOSITORY:-$CI_REGISTRY_IMAGE/$CI_COMMIT_REF_SLUG}
+      export CI_APPLICATION_TAG=${CI_APPLICATION_TAG:-$CI_COMMIT_SHA}
+    else
+      export CI_APPLICATION_REPOSITORY=${CI_APPLICATION_REPOSITORY:-$CI_REGISTRY_IMAGE}
+      export CI_APPLICATION_TAG=${CI_APPLICATION_TAG:-$CI_COMMIT_TAG}
+    fi
+  - "/build/build.sh"
+  :rules:
+  - :if: $AUTO_DEVOPS_PLATFORM_TARGET == "EC2"
+    :when: never
+  - :if: "$CI_COMMIT_TAG || $CI_COMMIT_BRANCH"
+:build_artifact:
+  :stage: build
+  :script:
+  - printf "To build your project, please create a build_artifact job into your .gitlab-ci.yml
+    file.\nMore information at https://docs.gitlab.com/ee/ci/cloud_deployment\n"
+  - exit 1
+  :rules:
+  - :if: $AUTO_DEVOPS_PLATFORM_TARGET == "EC2"
+:test:
+  :variables:
+    :POSTGRES_VERSION: 9.6.16
+    :POSTGRES_DB: test
+    :POSTGRES_USER: user
+    :POSTGRES_PASSWORD: testing-password
+  :services:
+  - postgres:${POSTGRES_VERSION}
+  :stage: test
+  :image: gliderlabs/herokuish:latest
+  :needs: []
+  :script:
+  - |
+    if [ -z ${KUBERNETES_PORT+x} ]; then
+      DB_HOST=postgres
+    else
+      DB_HOST=localhost
+    fi
+  - export DATABASE_URL="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${DB_HOST}:5432/${POSTGRES_DB}"
+  - cp -R . /tmp/app
+  - "/bin/herokuish buildpack test"
+  :rules:
+  - :if: "$TEST_DISABLED"
+    :when: never
+  - :if: "$CI_COMMIT_TAG || $CI_COMMIT_BRANCH"
+:code_quality:
+  :stage: test
+  :image: docker:19.03.12
+  :allow_failure: true
+  :services:
+  - docker:19.03.12-dind
+  :variables:
+    :DOCKER_DRIVER: overlay2
+    :DOCKER_TLS_CERTDIR: ''
+    :CODE_QUALITY_IMAGE: registry.gitlab.com/gitlab-org/ci-cd/codequality:0.85.23
+  :needs: []
+  :script:
+  - export SOURCE_CODE=$PWD
+  - |
+    if ! docker info &>/dev/null; then
+      if [ -z "$DOCKER_HOST" -a "$KUBERNETES_PORT" ]; then
+        export DOCKER_HOST='tcp://localhost:2375'
+      fi
+    fi
+  - |
+    function propagate_env_vars() {
+      CURRENT_ENV=$(printenv)
+
+      for VAR_NAME; do
+        echo $CURRENT_ENV | grep "${VAR_NAME}=" > /dev/null && echo "--env $VAR_NAME "
+      done
+    }
+  - docker pull --quiet "$CODE_QUALITY_IMAGE"
+  - |
+    docker run \
+      $(propagate_env_vars \
+        SOURCE_CODE \
+        TIMEOUT_SECONDS \
+        CODECLIMATE_DEBUG \
+        CODECLIMATE_DEV \
+        REPORT_STDOUT \
+        REPORT_FORMAT \
+        ENGINE_MEMORY_LIMIT_BYTES \
+      ) \
+      --volume "$PWD":/code \
+      --volume /var/run/docker.sock:/var/run/docker.sock \
+      "$CODE_QUALITY_IMAGE" /code
+  :artifacts:
+    :reports:
+      :codequality:
+      - gl-code-quality-report.json
+    :expire_in: 1 week
+  :dependencies: []
+  :rules:
+  - :if: "$CODE_QUALITY_DISABLED"
+    :when: never
+  - :if: "$CI_COMMIT_TAG || $CI_COMMIT_BRANCH"
+:code_intelligence_go:
+  :stage: test
+  :needs: []
+  :allow_failure: true
+  :image: sourcegraph/lsif-go:v1
+  :rules:
+  - :if: "$CODE_INTELLIGENCE_DISABLED"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH"
+    :exists:
+    - "**/*.go"
+  :script:
+  - lsif-go
+  :artifacts:
+    :reports:
+      :lsif:
+      - dump.lsif
+:.auto-deploy:
+  :image: registry.gitlab.com/gitlab-org/cluster-integration/auto-deploy-image:v1.0.7
+  :dependencies: []
+:review:
+  :image: registry.gitlab.com/gitlab-org/cluster-integration/auto-deploy-image:v1.0.7
+  :dependencies: []
+  :extends: ".auto-deploy"
+  :stage: review
+  :script:
+  - auto-deploy check_kube_domain
+  - auto-deploy download_chart
+  - auto-deploy ensure_namespace
+  - auto-deploy initialize_tiller
+  - auto-deploy create_secret
+  - auto-deploy deploy
+  - auto-deploy persist_environment_url
+  :environment:
+    :name: review/$CI_COMMIT_REF_NAME
+    :url: http://$CI_PROJECT_ID-$CI_ENVIRONMENT_SLUG.$KUBE_INGRESS_BASE_DOMAIN
+    :on_stop: stop_review
+  :artifacts:
+    :paths:
+    - environment_url.txt
+    - tiller.log
+    :when: always
+  :rules:
+  - :if: $CI_KUBERNETES_ACTIVE == null || $CI_KUBERNETES_ACTIVE == ""
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"
+    :when: never
+  - :if: "$REVIEW_DISABLED"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH == 'develop'"
+
+:stop_review:
+  :image: registry.gitlab.com/gitlab-org/cluster-integration/auto-deploy-image:v1.0.7
+  :dependencies: []
+  :extends: ".auto-deploy"
+  :stage: cleanup
+  :variables:
+    :GIT_STRATEGY: none
+  :script:
+  - auto-deploy initialize_tiller
+  - auto-deploy delete
+  :environment:
+    :name: review/$CI_COMMIT_REF_NAME
+    :action: stop
+  :allow_failure: true
+  :rules:
+  - :if: $CI_KUBERNETES_ACTIVE == null || $CI_KUBERNETES_ACTIVE == ""
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"
+    :when: never
+  - :if: "$REVIEW_DISABLED"
+    :when: never
+  - :if: "$CI_COMMIT_TAG || $CI_COMMIT_BRANCH"
+    :when: manual
+:staging:
+  :image: registry.gitlab.com/gitlab-org/cluster-integration/auto-deploy-image:v1.0.7
+  :dependencies: []
+  :extends: ".auto-deploy"
+  :stage: staging
+  :script:
+  - auto-deploy check_kube_domain
+  - auto-deploy download_chart
+  - auto-deploy ensure_namespace
+  - auto-deploy initialize_tiller
+  - auto-deploy create_secret
+  - auto-deploy deploy
+  :environment:
+    :name: staging
+    :url: http://$CI_PROJECT_PATH_SLUG-staging.$KUBE_INGRESS_BASE_DOMAIN
+  :rules:
+  - :if: $CI_KUBERNETES_ACTIVE == null || $CI_KUBERNETES_ACTIVE == ""
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH"
+    :when: never
+  - :if: "$STAGING_ENABLED"
+:canary:
+  :image: registry.gitlab.com/gitlab-org/cluster-integration/auto-deploy-image:v1.0.7
+  :dependencies: []
+  :extends: ".auto-deploy"
+  :stage: canary
+  :allow_failure: true
+  :script:
+  - auto-deploy check_kube_domain
+  - auto-deploy download_chart
+  - auto-deploy ensure_namespace
+  - auto-deploy initialize_tiller
+  - auto-deploy create_secret
+  - auto-deploy deploy canary
+  :environment:
+    :name: production
+    :url: http://$CI_PROJECT_PATH_SLUG.$KUBE_INGRESS_BASE_DOMAIN
+  :rules:
+  - :if: $CI_KUBERNETES_ACTIVE == null || $CI_KUBERNETES_ACTIVE == ""
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH"
+    :when: never
+  - :if: "$CANARY_ENABLED"
+    :when: manual
+:.production:
+  :image: registry.gitlab.com/gitlab-org/cluster-integration/auto-deploy-image:v1.0.7
+  :dependencies: []
+  :extends: ".auto-deploy"
+  :stage: production
+  :script:
+  - auto-deploy check_kube_domain
+  - auto-deploy download_chart
+  - auto-deploy ensure_namespace
+  - auto-deploy initialize_tiller
+  - auto-deploy create_secret
+  - auto-deploy deploy
+  - auto-deploy delete canary
+  - auto-deploy delete rollout
+  - auto-deploy persist_environment_url
+  :environment:
+    :name: production
+    :url: http://$CI_PROJECT_PATH_SLUG.$KUBE_INGRESS_BASE_DOMAIN
+  :artifacts:
+    :paths:
+    - environment_url.txt
+    - tiller.log
+    :when: always
+:production:
+  :image: registry.gitlab.com/gitlab-org/cluster-integration/auto-deploy-image:v1.0.7
+  :dependencies: []
+  :extends: ".auto-deploy"
+  :stage: production
+  :script:
+  - auto-deploy check_kube_domain
+  - auto-deploy download_chart
+  - auto-deploy ensure_namespace
+  - auto-deploy initialize_tiller
+  - auto-deploy create_secret
+  - auto-deploy deploy
+  - auto-deploy delete canary
+  - auto-deploy delete rollout
+  - auto-deploy persist_environment_url
+  :environment:
+    :name: production
+    :url: http://$CI_PROJECT_PATH_SLUG.$KUBE_INGRESS_BASE_DOMAIN
+  :artifacts:
+    :paths:
+    - environment_url.txt
+    - tiller.log
+    :when: always
+  :rules:
+  - :if: $CI_KUBERNETES_ACTIVE == null || $CI_KUBERNETES_ACTIVE == ""
+    :when: never
+  - :if: "$STAGING_ENABLED"
+    :when: never
+  - :if: "$CANARY_ENABLED"
+    :when: never
+  - :if: "$INCREMENTAL_ROLLOUT_ENABLED"
+    :when: never
+  - :if: "$INCREMENTAL_ROLLOUT_MODE"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"
+:production_manual:
+  :image: registry.gitlab.com/gitlab-org/cluster-integration/auto-deploy-image:v1.0.7
+  :dependencies: []
+  :extends: ".auto-deploy"
+  :stage: production
+  :script:
+  - auto-deploy check_kube_domain
+  - auto-deploy download_chart
+  - auto-deploy ensure_namespace
+  - auto-deploy initialize_tiller
+  - auto-deploy create_secret
+  - auto-deploy deploy
+  - auto-deploy delete canary
+  - auto-deploy delete rollout
+  - auto-deploy persist_environment_url
+  :environment:
+    :name: production
+    :url: http://$CI_PROJECT_PATH_SLUG.$KUBE_INGRESS_BASE_DOMAIN
+  :artifacts:
+    :paths:
+    - environment_url.txt
+    - tiller.log
+    :when: always
+  :allow_failure: false
+  :rules:
+  - :if: $CI_KUBERNETES_ACTIVE == null || $CI_KUBERNETES_ACTIVE == ""
+    :when: never
+  - :if: "$INCREMENTAL_ROLLOUT_ENABLED"
+    :when: never
+  - :if: "$INCREMENTAL_ROLLOUT_MODE"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $STAGING_ENABLED"
+    :when: manual
+  - :if: "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CANARY_ENABLED"
+    :when: manual
+:.rollout:
+  :image: registry.gitlab.com/gitlab-org/cluster-integration/auto-deploy-image:v1.0.7
+  :dependencies: []
+  :extends: ".auto-deploy"
+  :script:
+  - auto-deploy check_kube_domain
+  - auto-deploy download_chart
+  - auto-deploy ensure_namespace
+  - auto-deploy initialize_tiller
+  - auto-deploy create_secret
+  - auto-deploy deploy rollout $ROLLOUT_PERCENTAGE
+  - auto-deploy scale stable $((100-ROLLOUT_PERCENTAGE))
+  - auto-deploy delete canary
+  - auto-deploy persist_environment_url
+  :environment:
+    :name: production
+    :url: http://$CI_PROJECT_PATH_SLUG.$KUBE_INGRESS_BASE_DOMAIN
+  :artifacts:
+    :paths:
+    - environment_url.txt
+    - tiller.log
+    :when: always
+:.manual_rollout_template:
+  :image: registry.gitlab.com/gitlab-org/cluster-integration/auto-deploy-image:v1.0.7
+  :dependencies: []
+  :extends: ".auto-deploy"
+  :script:
+  - auto-deploy check_kube_domain
+  - auto-deploy download_chart
+  - auto-deploy ensure_namespace
+  - auto-deploy initialize_tiller
+  - auto-deploy create_secret
+  - auto-deploy deploy rollout $ROLLOUT_PERCENTAGE
+  - auto-deploy scale stable $((100-ROLLOUT_PERCENTAGE))
+  - auto-deploy delete canary
+  - auto-deploy persist_environment_url
+  :environment:
+    :name: production
+    :url: http://$CI_PROJECT_PATH_SLUG.$KUBE_INGRESS_BASE_DOMAIN
+  :artifacts:
+    :paths:
+    - environment_url.txt
+    - tiller.log
+    :when: always
+  :stage: production
+  :resource_group: production
+  :allow_failure: true
+  :rules:
+  - :if: $CI_KUBERNETES_ACTIVE == null || $CI_KUBERNETES_ACTIVE == ""
+    :when: never
+  - :if: $INCREMENTAL_ROLLOUT_MODE == "timed"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH"
+    :when: never
+  - :if: $INCREMENTAL_ROLLOUT_MODE == "manual" || $INCREMENTAL_ROLLOUT_ENABLED
+    :when: manual
+:.timed_rollout_template:
+  :image: registry.gitlab.com/gitlab-org/cluster-integration/auto-deploy-image:v1.0.7
+  :dependencies: []
+  :extends: ".auto-deploy"
+  :script:
+  - auto-deploy check_kube_domain
+  - auto-deploy download_chart
+  - auto-deploy ensure_namespace
+  - auto-deploy initialize_tiller
+  - auto-deploy create_secret
+  - auto-deploy deploy rollout $ROLLOUT_PERCENTAGE
+  - auto-deploy scale stable $((100-ROLLOUT_PERCENTAGE))
+  - auto-deploy delete canary
+  - auto-deploy persist_environment_url
+  :environment:
+    :name: production
+    :url: http://$CI_PROJECT_PATH_SLUG.$KUBE_INGRESS_BASE_DOMAIN
+  :artifacts:
+    :paths:
+    - environment_url.txt
+    - tiller.log
+    :when: always
+  :rules:
+  - :if: $CI_KUBERNETES_ACTIVE == null || $CI_KUBERNETES_ACTIVE == ""
+    :when: never
+  - :if: $INCREMENTAL_ROLLOUT_MODE == "manual"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH"
+    :when: never
+  - :if: $INCREMENTAL_ROLLOUT_MODE == "timed"
+    :when: delayed
+    :start_in: 5 minutes
+:timed rollout 10%:
+  :image: registry.gitlab.com/gitlab-org/cluster-integration/auto-deploy-image:v1.0.7
+  :dependencies: []
+  :extends: ".auto-deploy"
+  :script:
+  - auto-deploy check_kube_domain
+  - auto-deploy download_chart
+  - auto-deploy ensure_namespace
+  - auto-deploy initialize_tiller
+  - auto-deploy create_secret
+  - auto-deploy deploy rollout $ROLLOUT_PERCENTAGE
+  - auto-deploy scale stable $((100-ROLLOUT_PERCENTAGE))
+  - auto-deploy delete canary
+  - auto-deploy persist_environment_url
+  :environment:
+    :name: production
+    :url: http://$CI_PROJECT_PATH_SLUG.$KUBE_INGRESS_BASE_DOMAIN
+  :artifacts:
+    :paths:
+    - environment_url.txt
+    - tiller.log
+    :when: always
+  :rules:
+  - :if: $CI_KUBERNETES_ACTIVE == null || $CI_KUBERNETES_ACTIVE == ""
+    :when: never
+  - :if: $INCREMENTAL_ROLLOUT_MODE == "manual"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH"
+    :when: never
+  - :if: $INCREMENTAL_ROLLOUT_MODE == "timed"
+    :when: delayed
+    :start_in: 5 minutes
+  :stage: incremental rollout 10%
+  :variables:
+    :ROLLOUT_PERCENTAGE: 10
+:timed rollout 25%:
+  :image: registry.gitlab.com/gitlab-org/cluster-integration/auto-deploy-image:v1.0.7
+  :dependencies: []
+  :extends: ".auto-deploy"
+  :script:
+  - auto-deploy check_kube_domain
+  - auto-deploy download_chart
+  - auto-deploy ensure_namespace
+  - auto-deploy initialize_tiller
+  - auto-deploy create_secret
+  - auto-deploy deploy rollout $ROLLOUT_PERCENTAGE
+  - auto-deploy scale stable $((100-ROLLOUT_PERCENTAGE))
+  - auto-deploy delete canary
+  - auto-deploy persist_environment_url
+  :environment:
+    :name: production
+    :url: http://$CI_PROJECT_PATH_SLUG.$KUBE_INGRESS_BASE_DOMAIN
+  :artifacts:
+    :paths:
+    - environment_url.txt
+    - tiller.log
+    :when: always
+  :rules:
+  - :if: $CI_KUBERNETES_ACTIVE == null || $CI_KUBERNETES_ACTIVE == ""
+    :when: never
+  - :if: $INCREMENTAL_ROLLOUT_MODE == "manual"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH"
+    :when: never
+  - :if: $INCREMENTAL_ROLLOUT_MODE == "timed"
+    :when: delayed
+    :start_in: 5 minutes
+  :stage: incremental rollout 25%
+  :variables:
+    :ROLLOUT_PERCENTAGE: 25
+:timed rollout 50%:
+  :image: registry.gitlab.com/gitlab-org/cluster-integration/auto-deploy-image:v1.0.7
+  :dependencies: []
+  :extends: ".auto-deploy"
+  :script:
+  - auto-deploy check_kube_domain
+  - auto-deploy download_chart
+  - auto-deploy ensure_namespace
+  - auto-deploy initialize_tiller
+  - auto-deploy create_secret
+  - auto-deploy deploy rollout $ROLLOUT_PERCENTAGE
+  - auto-deploy scale stable $((100-ROLLOUT_PERCENTAGE))
+  - auto-deploy delete canary
+  - auto-deploy persist_environment_url
+  :environment:
+    :name: production
+    :url: http://$CI_PROJECT_PATH_SLUG.$KUBE_INGRESS_BASE_DOMAIN
+  :artifacts:
+    :paths:
+    - environment_url.txt
+    - tiller.log
+    :when: always
+  :rules:
+  - :if: $CI_KUBERNETES_ACTIVE == null || $CI_KUBERNETES_ACTIVE == ""
+    :when: never
+  - :if: $INCREMENTAL_ROLLOUT_MODE == "manual"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH"
+    :when: never
+  - :if: $INCREMENTAL_ROLLOUT_MODE == "timed"
+    :when: delayed
+    :start_in: 5 minutes
+  :stage: incremental rollout 50%
+  :variables:
+    :ROLLOUT_PERCENTAGE: 50
+:timed rollout 100%:
+  :image: registry.gitlab.com/gitlab-org/cluster-integration/auto-deploy-image:v1.0.7
+  :dependencies: []
+  :extends: ".auto-deploy"
+  :script:
+  - auto-deploy check_kube_domain
+  - auto-deploy download_chart
+  - auto-deploy ensure_namespace
+  - auto-deploy initialize_tiller
+  - auto-deploy create_secret
+  - auto-deploy deploy
+  - auto-deploy delete canary
+  - auto-deploy delete rollout
+  - auto-deploy persist_environment_url
+  :environment:
+    :name: production
+    :url: http://$CI_PROJECT_PATH_SLUG.$KUBE_INGRESS_BASE_DOMAIN
+  :artifacts:
+    :paths:
+    - environment_url.txt
+    - tiller.log
+    :when: always
+  :rules:
+  - :if: $CI_KUBERNETES_ACTIVE == null || $CI_KUBERNETES_ACTIVE == ""
+    :when: never
+  - :if: $INCREMENTAL_ROLLOUT_MODE == "manual"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH"
+    :when: never
+  - :if: $INCREMENTAL_ROLLOUT_MODE == "timed"
+    :when: delayed
+    :start_in: 5 minutes
+  :stage: incremental rollout 100%
+  :variables:
+    :ROLLOUT_PERCENTAGE: 100
+:rollout 10%:
+  :image: registry.gitlab.com/gitlab-org/cluster-integration/auto-deploy-image:v1.0.7
+  :dependencies: []
+  :extends: ".auto-deploy"
+  :script:
+  - auto-deploy check_kube_domain
+  - auto-deploy download_chart
+  - auto-deploy ensure_namespace
+  - auto-deploy initialize_tiller
+  - auto-deploy create_secret
+  - auto-deploy deploy rollout $ROLLOUT_PERCENTAGE
+  - auto-deploy scale stable $((100-ROLLOUT_PERCENTAGE))
+  - auto-deploy delete canary
+  - auto-deploy persist_environment_url
+  :environment:
+    :name: production
+    :url: http://$CI_PROJECT_PATH_SLUG.$KUBE_INGRESS_BASE_DOMAIN
+  :artifacts:
+    :paths:
+    - environment_url.txt
+    - tiller.log
+    :when: always
+  :stage: production
+  :resource_group: production
+  :allow_failure: true
+  :rules:
+  - :if: $CI_KUBERNETES_ACTIVE == null || $CI_KUBERNETES_ACTIVE == ""
+    :when: never
+  - :if: $INCREMENTAL_ROLLOUT_MODE == "timed"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH"
+    :when: never
+  - :if: $INCREMENTAL_ROLLOUT_MODE == "manual" || $INCREMENTAL_ROLLOUT_ENABLED
+    :when: manual
+  :variables:
+    :ROLLOUT_PERCENTAGE: 10
+:rollout 25%:
+  :image: registry.gitlab.com/gitlab-org/cluster-integration/auto-deploy-image:v1.0.7
+  :dependencies: []
+  :extends: ".auto-deploy"
+  :script:
+  - auto-deploy check_kube_domain
+  - auto-deploy download_chart
+  - auto-deploy ensure_namespace
+  - auto-deploy initialize_tiller
+  - auto-deploy create_secret
+  - auto-deploy deploy rollout $ROLLOUT_PERCENTAGE
+  - auto-deploy scale stable $((100-ROLLOUT_PERCENTAGE))
+  - auto-deploy delete canary
+  - auto-deploy persist_environment_url
+  :environment:
+    :name: production
+    :url: http://$CI_PROJECT_PATH_SLUG.$KUBE_INGRESS_BASE_DOMAIN
+  :artifacts:
+    :paths:
+    - environment_url.txt
+    - tiller.log
+    :when: always
+  :stage: production
+  :resource_group: production
+  :allow_failure: true
+  :rules:
+  - :if: $CI_KUBERNETES_ACTIVE == null || $CI_KUBERNETES_ACTIVE == ""
+    :when: never
+  - :if: $INCREMENTAL_ROLLOUT_MODE == "timed"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH"
+    :when: never
+  - :if: $INCREMENTAL_ROLLOUT_MODE == "manual" || $INCREMENTAL_ROLLOUT_ENABLED
+    :when: manual
+  :variables:
+    :ROLLOUT_PERCENTAGE: 25
+:rollout 50%:
+  :image: registry.gitlab.com/gitlab-org/cluster-integration/auto-deploy-image:v1.0.7
+  :dependencies: []
+  :extends: ".auto-deploy"
+  :script:
+  - auto-deploy check_kube_domain
+  - auto-deploy download_chart
+  - auto-deploy ensure_namespace
+  - auto-deploy initialize_tiller
+  - auto-deploy create_secret
+  - auto-deploy deploy rollout $ROLLOUT_PERCENTAGE
+  - auto-deploy scale stable $((100-ROLLOUT_PERCENTAGE))
+  - auto-deploy delete canary
+  - auto-deploy persist_environment_url
+  :environment:
+    :name: production
+    :url: http://$CI_PROJECT_PATH_SLUG.$KUBE_INGRESS_BASE_DOMAIN
+  :artifacts:
+    :paths:
+    - environment_url.txt
+    - tiller.log
+    :when: always
+  :stage: production
+  :resource_group: production
+  :allow_failure: true
+  :rules:
+  - :if: $CI_KUBERNETES_ACTIVE == null || $CI_KUBERNETES_ACTIVE == ""
+    :when: never
+  - :if: $INCREMENTAL_ROLLOUT_MODE == "timed"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH"
+    :when: never
+  - :if: $INCREMENTAL_ROLLOUT_MODE == "manual" || $INCREMENTAL_ROLLOUT_ENABLED
+    :when: manual
+  :variables:
+    :ROLLOUT_PERCENTAGE: 50
+:rollout 100%:
+  :image: registry.gitlab.com/gitlab-org/cluster-integration/auto-deploy-image:v1.0.7
+  :dependencies: []
+  :extends: ".auto-deploy"
+  :script:
+  - auto-deploy check_kube_domain
+  - auto-deploy download_chart
+  - auto-deploy ensure_namespace
+  - auto-deploy initialize_tiller
+  - auto-deploy create_secret
+  - auto-deploy deploy
+  - auto-deploy delete canary
+  - auto-deploy delete rollout
+  - auto-deploy persist_environment_url
+  :environment:
+    :name: production
+    :url: http://$CI_PROJECT_PATH_SLUG.$KUBE_INGRESS_BASE_DOMAIN
+  :artifacts:
+    :paths:
+    - environment_url.txt
+    - tiller.log
+    :when: always
+  :stage: production
+  :resource_group: production
+  :allow_failure: false
+  :rules:
+  - :if: $CI_KUBERNETES_ACTIVE == null || $CI_KUBERNETES_ACTIVE == ""
+    :when: never
+  - :if: $INCREMENTAL_ROLLOUT_MODE == "timed"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH"
+    :when: never
+  - :if: $INCREMENTAL_ROLLOUT_MODE == "manual" || $INCREMENTAL_ROLLOUT_ENABLED
+    :when: manual
+:.ecs_image:
+  :image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-ecs:latest
+:.deploy_to_ecs:
+  :image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-ecs:latest
+  :extends: ".ecs_image"
+  :dependencies: []
+  :script:
+  - ecs update-task-definition
+:.review_ecs_base:
+  :image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-ecs:latest
+  :extends: ".deploy_to_ecs"
+  :dependencies: []
+  :script:
+  - ecs update-task-definition
+  :stage: review
+:.production_ecs_base:
+  :image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-ecs:latest
+  :extends: ".deploy_to_ecs"
+  :dependencies: []
+  :script:
+  - ecs update-task-definition
+  :stage: production
+  :environment:
+    :name: production
+:.stop_review_ecs_base:
+  :image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-ecs:latest
+  :extends: ".ecs_image"
+  :stage: cleanup
+  :allow_failure: true
+  :script:
+  - ecs stop-task
+:review_ecs:
+  :image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-ecs:latest
+  :extends: ".review_ecs_base"
+  :dependencies: []
+  :script:
+  - ecs update-task-definition
+  :stage: review
+  :environment:
+    :name: review/$CI_COMMIT_REF_NAME
+    :on_stop: stop_review_ecs
+  :rules:
+  - :if: $AUTO_DEVOPS_PLATFORM_TARGET != "ECS"
+    :when: never
+  - :if: "$CI_KUBERNETES_ACTIVE"
+    :when: never
+  - :if: "$REVIEW_DISABLED"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"
+    :when: never
+  - :if: "$CI_COMMIT_TAG || $CI_COMMIT_BRANCH"
+:stop_review_ecs:
+  :image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-ecs:latest
+  :extends: ".stop_review_ecs_base"
+  :stage: cleanup
+  :allow_failure: true
+  :script:
+  - ecs stop-task
+  :environment:
+    :name: review/$CI_COMMIT_REF_NAME
+    :action: stop
+  :rules:
+  - :if: $AUTO_DEVOPS_PLATFORM_TARGET != "ECS"
+    :when: never
+  - :if: "$CI_KUBERNETES_ACTIVE"
+    :when: never
+  - :if: "$REVIEW_DISABLED"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"
+    :when: never
+  - :if: "$CI_COMMIT_TAG || $CI_COMMIT_BRANCH"
+    :when: manual
+:review_fargate:
+  :image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-ecs:latest
+  :extends: ".review_ecs_base"
+  :dependencies: []
+  :script:
+  - ecs update-task-definition
+  :stage: review
+  :environment:
+    :name: review/$CI_COMMIT_REF_NAME
+    :on_stop: stop_review_fargate
+  :rules:
+  - :if: $AUTO_DEVOPS_PLATFORM_TARGET != "FARGATE"
+    :when: never
+  - :if: "$CI_KUBERNETES_ACTIVE"
+    :when: never
+  - :if: "$REVIEW_DISABLED"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"
+    :when: never
+  - :if: "$CI_COMMIT_TAG || $CI_COMMIT_BRANCH"
+:stop_review_fargate:
+  :image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-ecs:latest
+  :extends: ".stop_review_ecs_base"
+  :stage: cleanup
+  :allow_failure: true
+  :script:
+  - ecs stop-task
+  :environment:
+    :name: review/$CI_COMMIT_REF_NAME
+    :action: stop
+  :rules:
+  - :if: $AUTO_DEVOPS_PLATFORM_TARGET != "FARGATE"
+    :when: never
+  - :if: "$CI_KUBERNETES_ACTIVE"
+    :when: never
+  - :if: "$REVIEW_DISABLED"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"
+    :when: never
+  - :if: "$CI_COMMIT_TAG || $CI_COMMIT_BRANCH"
+    :when: manual
+:production_ecs:
+  :image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-ecs:latest
+  :extends: ".production_ecs_base"
+  :dependencies: []
+  :script:
+  - ecs update-task-definition
+  :stage: production
+  :environment:
+    :name: production
+  :rules:
+  - :if: $AUTO_DEVOPS_PLATFORM_TARGET != "ECS"
+    :when: never
+  - :if: "$CI_KUBERNETES_ACTIVE"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH"
+    :when: never
+  - :if: "$CI_COMMIT_TAG || $CI_COMMIT_BRANCH"
+:production_fargate:
+  :image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-ecs:latest
+  :extends: ".production_ecs_base"
+  :dependencies: []
+  :script:
+  - ecs update-task-definition
+  :stage: production
+  :environment:
+    :name: production
+  :rules:
+  - :if: $AUTO_DEVOPS_PLATFORM_TARGET != "FARGATE"
+    :when: never
+  - :if: "$CI_KUBERNETES_ACTIVE"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH"
+    :when: never
+  - :if: "$CI_COMMIT_TAG || $CI_COMMIT_BRANCH"
+:stages:
+- ".pre"
+- build
+- test
+- deploy
+- review
+- dast
+- staging
+- canary
+- production
+- incremental rollout 10%
+- incremental rollout 25%
+- incremental rollout 50%
+- incremental rollout 100%
+- performance
+- cleanup
+- ".post"
+:.push-and-deploy:
+  :image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-ec2:latest
+  :script:
+  - gl-ec2 push-to-s3
+  - gl-ec2 deploy-to-ec2
+:review_ec2:
+  :image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-ec2:latest
+  :script:
+  - gl-ec2 push-to-s3
+  - gl-ec2 deploy-to-ec2
+  :extends: ".push-and-deploy"
+  :stage: review
+  :environment:
+    :name: review/$CI_COMMIT_REF_NAME
+  :rules:
+  - :if: $AUTO_DEVOPS_PLATFORM_TARGET != "EC2"
+    :when: never
+  - :if: "$CI_KUBERNETES_ACTIVE"
+    :when: never
+  - :if: "$REVIEW_DISABLED"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"
+    :when: never
+  - :if: "$CI_COMMIT_TAG || $CI_COMMIT_BRANCH"
+:production_ec2:
+  :image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-ec2:latest
+  :script:
+  - gl-ec2 push-to-s3
+  - gl-ec2 deploy-to-ec2
+  :extends: ".push-and-deploy"
+  :stage: production
+  :environment:
+    :name: production
+  :rules:
+  - :if: $AUTO_DEVOPS_PLATFORM_TARGET != "EC2"
+    :when: never
+  - :if: "$CI_KUBERNETES_ACTIVE"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH"
+    :when: never
+  - :if: "$CI_COMMIT_TAG || $CI_COMMIT_BRANCH"
+:.dast-auto-deploy:
+  :image: registry.gitlab.com/gitlab-org/cluster-integration/auto-deploy-image:v1.0.7
+:dast_environment_deploy:
+  :image: registry.gitlab.com/gitlab-org/cluster-integration/auto-deploy-image:v1.0.7
+  :extends: ".dast-auto-deploy"
+  :stage: review
+  :script:
+  - auto-deploy check_kube_domain
+  - auto-deploy download_chart
+  - auto-deploy ensure_namespace
+  - auto-deploy initialize_tiller
+  - auto-deploy create_secret
+  - auto-deploy deploy
+  - auto-deploy persist_environment_url
+  :environment:
+    :name: dast-default
+    :url: http://dast-$CI_PROJECT_ID-$CI_ENVIRONMENT_SLUG.$KUBE_INGRESS_BASE_DOMAIN
+    :on_stop: stop_dast_environment
+  :artifacts:
+    :paths:
+    - environment_url.txt
+  :rules:
+  - :if: "$CI_DEFAULT_BRANCH != $CI_COMMIT_REF_NAME"
+    :when: never
+  - :if: "$DAST_DISABLED || $DAST_DISABLED_FOR_DEFAULT_BRANCH"
+    :when: never
+  - :if: "$DAST_WEBSITE"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH && $CI_KUBERNETES_ACTIVE && $GITLAB_FEATURES =~ /\\bdast\\b/"
+:stop_dast_environment:
+  :image: registry.gitlab.com/gitlab-org/cluster-integration/auto-deploy-image:v1.0.7
+  :extends: ".dast-auto-deploy"
+  :stage: cleanup
+  :variables:
+    :GIT_STRATEGY: none
+  :script:
+  - auto-deploy initialize_tiller
+  - auto-deploy delete
+  :environment:
+    :name: dast-default
+    :action: stop
+  :needs:
+  - dast
+  :rules:
+  - :if: "$CI_DEFAULT_BRANCH != $CI_COMMIT_REF_NAME"
+    :when: never
+  - :if: "$DAST_DISABLED || $DAST_DISABLED_FOR_DEFAULT_BRANCH"
+    :when: never
+  - :if: "$DAST_WEBSITE"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH && $CI_KUBERNETES_ACTIVE && $GITLAB_FEATURES =~ /\\bdast\\b/"
+    :when: always
+:performance:
+  :stage: performance
+  :image: docker:19.03.12
+  :allow_failure: true
+  :variables:
+    :DOCKER_TLS_CERTDIR: ''
+    :SITESPEED_IMAGE: sitespeedio/sitespeed.io
+    :SITESPEED_VERSION: 14.1.0
+    :SITESPEED_OPTIONS: ''
+  :services:
+  - docker:19.03.12-dind
+  :script:
+  - |
+    if ! docker info &>/dev/null; then
+      if [ -z "$DOCKER_HOST" -a "$KUBERNETES_PORT" ]; then
+        export DOCKER_HOST='tcp://localhost:2375'
+      fi
+    fi
+  - export CI_ENVIRONMENT_URL=$(cat environment_url.txt)
+  - mkdir gitlab-exporter
+  - wget -O gitlab-exporter/index.js https://gitlab.com/gitlab-org/gl-performance/raw/1.1.0/index.js
+  - mkdir sitespeed-results
+  - |
+    if [ -f .gitlab-urls.txt ]
+    then
+      sed -i -e 's@^@'"$CI_ENVIRONMENT_URL"'@' .gitlab-urls.txt
+      docker run --shm-size=1g --rm -v "$(pwd)":/sitespeed.io $SITESPEED_IMAGE:$SITESPEED_VERSION --plugins.add ./gitlab-exporter --cpu --outputFolder sitespeed-results .gitlab-urls.txt $SITESPEED_OPTIONS
+    else
+      docker run --shm-size=1g --rm -v "$(pwd)":/sitespeed.io $SITESPEED_IMAGE:$SITESPEED_VERSION --plugins.add ./gitlab-exporter --cpu --outputFolder sitespeed-results "$CI_ENVIRONMENT_URL" $SITESPEED_OPTIONS
+    fi
+  - mv sitespeed-results/data/performance.json browser-performance.json
+  :artifacts:
+    :paths:
+    - sitespeed-results/
+    :reports:
+      :browser_performance:
+      - browser-performance.json
+  :rules:
+  - :if: $CI_KUBERNETES_ACTIVE == null || $CI_KUBERNETES_ACTIVE == ""
+    :when: never
+  - :if: "$PERFORMANCE_DISABLED"
+    :when: never
+  - :if: "$CI_COMMIT_TAG || $CI_COMMIT_BRANCH"
+:variables:
+  :DAST_VERSION: 1
+  :SECURE_ANALYZERS_PREFIX: registry.gitlab.com/gitlab-org/security-products/analyzers
+  :CS_MAJOR_VERSION: 3
+  :DS_DEFAULT_ANALYZERS: bundler-audit, retire.js, gemnasium, gemnasium-maven, gemnasium-python
+  :DS_EXCLUDED_PATHS: spec, test, tests, tmp
+  :DS_MAJOR_VERSION: 2
+  :LICENSE_MANAGEMENT_SETUP_CMD: ''
+  :LICENSE_MANAGEMENT_VERSION: 3
+  :SAST_DEFAULT_ANALYZERS: bandit, brakeman, gosec, spotbugs, flawfinder, phpcs-security-audit,
+    security-code-scan, nodejs-scan, eslint, sobelow, pmd-apex, kubesec, mobsf, semgrep
+  :SAST_EXCLUDED_ANALYZERS: ''
+  :SAST_EXCLUDED_PATHS: spec, test, tests, tmp
+  :SAST_ANALYZER_IMAGE_TAG: 2
+  :SCAN_KUBERNETES_MANIFESTS: 'false'
+  :SECRETS_ANALYZER_VERSION: '3'
+  :SECRET_DETECTION_EXCLUDED_PATHS: ''
+  :POSTGRES_USER: user
+  :POSTGRES_PASSWORD: testing-password
+  :POSTGRES_ENABLED: 'true'
+  :POSTGRES_DB: "$CI_ENVIRONMENT_SLUG"
+  :DOCKER_DRIVER: overlay2
+  :ROLLOUT_RESOURCE_TYPE: deployment
+  :DOCKER_TLS_CERTDIR: ''
+:dast:
+  :stage: dast
+  :image:
+    :name: "$SECURE_ANALYZERS_PREFIX/dast:$DAST_VERSION"
+  :variables:
+    :GIT_STRATEGY: none
+  :allow_failure: true
+  :script:
+  - export DAST_WEBSITE=${DAST_WEBSITE:-$(cat environment_url.txt)}
+  - if [ -z "$DAST_WEBSITE$DAST_API_SPECIFICATION" ]; then echo "Either DAST_WEBSITE
+    or DAST_API_SPECIFICATION must be set. See https://docs.gitlab.com/ee/user/application_security/dast/#configuration
+    for more details." && exit 1; fi
+  - "/analyze"
+  :artifacts:
+    :reports:
+      :dast:
+      - gl-dast-report.json
+  :rules:
+  - :if: "$DAST_DISABLED"
+    :when: never
+  - :if: "$DAST_DISABLED_FOR_DEFAULT_BRANCH && $CI_DEFAULT_BRANCH == $CI_COMMIT_REF_NAME"
+    :when: never
+  - :if: "$CI_DEFAULT_BRANCH != $CI_COMMIT_REF_NAME && $REVIEW_DISABLED && $DAST_WEBSITE
+      == null && $DAST_API_SPECIFICATION == null"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH && $CI_KUBERNETES_ACTIVE && $GITLAB_FEATURES =~ /\\bdast\\b/"
+  - :if: "$CI_COMMIT_BRANCH && $GITLAB_FEATURES =~ /\\bdast\\b/ && $DAST_WEBSITE"
+  - :if: "$CI_COMMIT_BRANCH && $GITLAB_FEATURES =~ /\\bdast\\b/ && $DAST_API_SPECIFICATION"
+:container_scanning:
+  :stage: test
+  :image: "$CS_ANALYZER_IMAGE"
+  :variables:
+    :CLAIR_DB_IMAGE_TAG: latest
+    :CLAIR_DB_IMAGE: "$SECURE_ANALYZERS_PREFIX/clair-vulnerabilities-db:$CLAIR_DB_IMAGE_TAG"
+    :GIT_STRATEGY: none
+    :CS_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/klar:$CS_MAJOR_VERSION"
+  :allow_failure: true
+  :services:
+  - :name: "$CLAIR_DB_IMAGE"
+    :alias: clair-vulnerabilities-db
+  :script:
+  - "/analyzer run"
+  :artifacts:
+    :reports:
+      :container_scanning:
+      - gl-container-scanning-report.json
+  :dependencies: []
+  :rules:
+  - :if: "$CONTAINER_SCANNING_DISABLED"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH && $GITLAB_FEATURES =~ /\\bcontainer_scanning\\b/"
+:dependency_scanning:
+  :stage: test
+  :script:
+  - echo "$CI_JOB_NAME is used for configuration only, and its script should not be
+    executed"
+  - exit 1
+  :artifacts:
+    :reports:
+      :dependency_scanning:
+      - gl-dependency-scanning-report.json
+  :dependencies: []
+  :rules:
+  - :when: never
+:.ds-analyzer:
+  :stage: test
+  :script:
+  - "/analyzer run"
+  :artifacts:
+    :reports:
+      :dependency_scanning: gl-dependency-scanning-report.json
+  :dependencies: []
+  :rules:
+  - :when: never
+  :extends: dependency_scanning
+  :allow_failure: true
+:gemnasium-dependency_scanning:
+  :stage: test
+  :script:
+  - "/analyzer run"
+  :artifacts:
+    :reports:
+      :dependency_scanning:
+      - gl-dependency-scanning-report.json
+  :dependencies: []
+  :rules:
+  - :if: "$DEPENDENCY_SCANNING_DISABLED"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH && $GITLAB_FEATURES =~ /\\bdependency_scanning\\b/ &&
+      $DS_DEFAULT_ANALYZERS =~ /gemnasium([^-]|$)/"
+    :exists:
+    - "{Gemfile.lock,*/Gemfile.lock,*/*/Gemfile.lock}"
+    - "{composer.lock,*/composer.lock,*/*/composer.lock}"
+    - "{gems.locked,*/gems.locked,*/*/gems.locked}"
+    - "{go.sum,*/go.sum,*/*/go.sum}"
+    - "{npm-shrinkwrap.json,*/npm-shrinkwrap.json,*/*/npm-shrinkwrap.json}"
+    - "{package-lock.json,*/package-lock.json,*/*/package-lock.json}"
+    - "{yarn.lock,*/yarn.lock,*/*/yarn.lock}"
+    - "{packages.lock.json,*/packages.lock.json,*/*/packages.lock.json}"
+    - "{conan.lock,*/conan.lock,*/*/conan.lock}"
+  :extends: ".ds-analyzer"
+  :allow_failure: true
+  :image:
+    :name: "$DS_ANALYZER_IMAGE"
+  :variables:
+    :DS_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/gemnasium:$DS_MAJOR_VERSION"
+:gemnasium-maven-dependency_scanning:
+  :stage: test
+  :script:
+  - "/analyzer run"
+  :artifacts:
+    :reports:
+      :dependency_scanning:
+      - gl-dependency-scanning-report.json
+  :dependencies: []
+  :rules:
+  - :if: "$DEPENDENCY_SCANNING_DISABLED"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH && $GITLAB_FEATURES =~ /\\bdependency_scanning\\b/ &&
+      $DS_DEFAULT_ANALYZERS =~ /gemnasium-maven/"
+    :exists:
+    - "{build.gradle,*/build.gradle,*/*/build.gradle}"
+    - "{build.gradle.kts,*/build.gradle.kts,*/*/build.gradle.kts}"
+    - "{build.sbt,*/build.sbt,*/*/build.sbt}"
+    - "{pom.xml,*/pom.xml,*/*/pom.xml}"
+  :extends: ".ds-analyzer"
+  :allow_failure: true
+  :image:
+    :name: "$DS_ANALYZER_IMAGE"
+  :variables:
+    :DS_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/gemnasium-maven:$DS_MAJOR_VERSION"
+:gemnasium-python-dependency_scanning:
+  :stage: test
+  :script:
+  - "/analyzer run"
+  :artifacts:
+    :reports:
+      :dependency_scanning:
+      - gl-dependency-scanning-report.json
+  :dependencies: []
+  :rules:
+  - :if: "$DEPENDENCY_SCANNING_DISABLED"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH && $GITLAB_FEATURES =~ /\\bdependency_scanning\\b/ &&
+      $DS_DEFAULT_ANALYZERS =~ /gemnasium-python/"
+    :exists:
+    - "{requirements.txt,*/requirements.txt,*/*/requirements.txt}"
+    - "{requirements.pip,*/requirements.pip,*/*/requirements.pip}"
+    - "{Pipfile,*/Pipfile,*/*/Pipfile}"
+    - "{requires.txt,*/requires.txt,*/*/requires.txt}"
+    - "{setup.py,*/setup.py,*/*/setup.py}"
+  - :if: "$CI_COMMIT_BRANCH && $GITLAB_FEATURES =~ /\\bdependency_scanning\\b/ &&
+      $DS_DEFAULT_ANALYZERS =~ /gemnasium-python/ && $PIP_REQUIREMENTS_FILE"
+  :extends: ".ds-analyzer"
+  :allow_failure: true
+  :image:
+    :name: "$DS_ANALYZER_IMAGE"
+  :variables:
+    :DS_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/gemnasium-python:$DS_MAJOR_VERSION"
+:bundler-audit-dependency_scanning:
+  :stage: test
+  :script:
+  - "/analyzer run"
+  :artifacts:
+    :reports:
+      :dependency_scanning:
+      - gl-dependency-scanning-report.json
+  :dependencies: []
+  :rules:
+  - :if: "$DEPENDENCY_SCANNING_DISABLED"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH && $GITLAB_FEATURES =~ /\\bdependency_scanning\\b/ &&
+      $DS_DEFAULT_ANALYZERS =~ /bundler-audit/"
+    :exists:
+    - "{Gemfile.lock,*/Gemfile.lock,*/*/Gemfile.lock}"
+  :extends: ".ds-analyzer"
+  :allow_failure: true
+  :image:
+    :name: "$DS_ANALYZER_IMAGE"
+  :variables:
+    :DS_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/bundler-audit:$DS_MAJOR_VERSION"
+:retire-js-dependency_scanning:
+  :stage: test
+  :script:
+  - "/analyzer run"
+  :artifacts:
+    :reports:
+      :dependency_scanning:
+      - gl-dependency-scanning-report.json
+  :dependencies: []
+  :rules:
+  - :if: "$DEPENDENCY_SCANNING_DISABLED"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH && $GITLAB_FEATURES =~ /\\bdependency_scanning\\b/ &&
+      $DS_DEFAULT_ANALYZERS =~ /retire.js/"
+    :exists:
+    - "{package.json,*/package.json,*/*/package.json}"
+  :extends: ".ds-analyzer"
+  :allow_failure: true
+  :image:
+    :name: "$DS_ANALYZER_IMAGE"
+  :variables:
+    :DS_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/retire.js:$DS_MAJOR_VERSION"
+:license_scanning:
+  :stage: test
+  :image:
+    :name: "$SECURE_ANALYZERS_PREFIX/license-finder:$LICENSE_MANAGEMENT_VERSION"
+    :entrypoint:
+    - ''
+  :variables:
+    :LM_REPORT_VERSION: '2.1'
+    :SETUP_CMD: "$LICENSE_MANAGEMENT_SETUP_CMD"
+  :allow_failure: true
+  :script:
+  - "/run.sh analyze ."
+  :artifacts:
+    :reports:
+      :license_scanning:
+      - gl-license-scanning-report.json
+  :dependencies: []
+  :rules:
+  - :if: "$LICENSE_MANAGEMENT_DISABLED"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH && $GITLAB_FEATURES =~ /\\blicense_scanning\\b/"
+:sast:
+  :stage: test
+  :artifacts:
+    :reports:
+      :sast:
+      - gl-sast-report.json
+  :rules:
+  - :when: never
+  :variables:
+    :SEARCH_MAX_DEPTH: 4
+  :script:
+  - echo "$CI_JOB_NAME is used for configuration only, and its script should not be
+    executed"
+  - exit 1
+:.sast-analyzer:
+  :stage: test
+  :artifacts:
+    :reports:
+      :sast: gl-sast-report.json
+  :rules:
+  - :when: never
+  :variables:
+    :SEARCH_MAX_DEPTH: 4
+  :script:
+  - "/analyzer run"
+  :extends: sast
+  :allow_failure: true
+:bandit-sast:
+  :stage: test
+  :artifacts:
+    :reports:
+      :sast:
+      - gl-sast-report.json
+  :rules:
+  - :if: "$SAST_DISABLED"
+    :when: never
+  - :if: "$SAST_EXCLUDED_ANALYZERS =~ /bandit/"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH && $SAST_DEFAULT_ANALYZERS =~ /bandit/"
+    :exists:
+    - "**/*.py"
+  :variables:
+    :SEARCH_MAX_DEPTH: 4
+    :SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/bandit:$SAST_ANALYZER_IMAGE_TAG"
+  :script:
+  - "/analyzer run"
+  :extends: ".sast-analyzer"
+  :allow_failure: true
+  :image:
+    :name: "$SAST_ANALYZER_IMAGE"
+:brakeman-sast:
+  :stage: test
+  :artifacts:
+    :reports:
+      :sast:
+      - gl-sast-report.json
+  :rules:
+  - :if: "$SAST_DISABLED"
+    :when: never
+  - :if: "$SAST_EXCLUDED_ANALYZERS =~ /brakeman/"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH && $SAST_DEFAULT_ANALYZERS =~ /brakeman/"
+    :exists:
+    - "**/*.rb"
+    - "**/Gemfile"
+  :variables:
+    :SEARCH_MAX_DEPTH: 4
+    :SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/brakeman:$SAST_ANALYZER_IMAGE_TAG"
+  :script:
+  - "/analyzer run"
+  :extends: ".sast-analyzer"
+  :allow_failure: true
+  :image:
+    :name: "$SAST_ANALYZER_IMAGE"
+:eslint-sast:
+  :stage: test
+  :artifacts:
+    :reports:
+      :sast:
+      - gl-sast-report.json
+  :rules:
+  - :if: "$SAST_DISABLED"
+    :when: never
+  - :if: "$SAST_EXCLUDED_ANALYZERS =~ /eslint/"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH && $SAST_DEFAULT_ANALYZERS =~ /eslint/"
+    :exists:
+    - "**/*.html"
+    - "**/*.js"
+    - "**/*.jsx"
+    - "**/*.ts"
+    - "**/*.tsx"
+  :variables:
+    :SEARCH_MAX_DEPTH: 4
+    :SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/eslint:$SAST_ANALYZER_IMAGE_TAG"
+  :script:
+  - "/analyzer run"
+  :extends: ".sast-analyzer"
+  :allow_failure: true
+  :image:
+    :name: "$SAST_ANALYZER_IMAGE"
+:flawfinder-sast:
+  :stage: test
+  :artifacts:
+    :reports:
+      :sast:
+      - gl-sast-report.json
+  :rules:
+  - :if: "$SAST_DISABLED"
+    :when: never
+  - :if: "$SAST_EXCLUDED_ANALYZERS =~ /flawfinder/"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH && $SAST_DEFAULT_ANALYZERS =~ /flawfinder/"
+    :exists:
+    - "**/*.c"
+    - "**/*.cpp"
+  :variables:
+    :SEARCH_MAX_DEPTH: 4
+    :SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/flawfinder:$SAST_ANALYZER_IMAGE_TAG"
+  :script:
+  - "/analyzer run"
+  :extends: ".sast-analyzer"
+  :allow_failure: true
+  :image:
+    :name: "$SAST_ANALYZER_IMAGE"
+:kubesec-sast:
+  :stage: test
+  :artifacts:
+    :reports:
+      :sast:
+      - gl-sast-report.json
+  :rules:
+  - :if: "$SAST_DISABLED"
+    :when: never
+  - :if: "$SAST_EXCLUDED_ANALYZERS =~ /kubesec/"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH && $SAST_DEFAULT_ANALYZERS =~ /kubesec/ && $SCAN_KUBERNETES_MANIFESTS
+      == 'true'"
+  :variables:
+    :SEARCH_MAX_DEPTH: 4
+    :SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/kubesec:$SAST_ANALYZER_IMAGE_TAG"
+  :script:
+  - "/analyzer run"
+  :extends: ".sast-analyzer"
+  :allow_failure: true
+  :image:
+    :name: "$SAST_ANALYZER_IMAGE"
+:gosec-sast:
+  :stage: test
+  :artifacts:
+    :reports:
+      :sast:
+      - gl-sast-report.json
+  :rules:
+  - :if: "$SAST_DISABLED"
+    :when: never
+  - :if: "$SAST_EXCLUDED_ANALYZERS =~ /gosec/"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH && $SAST_DEFAULT_ANALYZERS =~ /gosec/"
+    :exists:
+    - "**/*.go"
+  :variables:
+    :SEARCH_MAX_DEPTH: 4
+    :SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/gosec:$SAST_ANALYZER_IMAGE_TAG"
+  :script:
+  - "/analyzer run"
+  :extends: ".sast-analyzer"
+  :allow_failure: true
+  :image:
+    :name: "$SAST_ANALYZER_IMAGE"
+:mobsf-android-sast:
+  :stage: test
+  :artifacts:
+    :reports:
+      :sast:
+      - gl-sast-report.json
+  :rules:
+  - :if: "$SAST_DISABLED"
+    :when: never
+  - :if: "$SAST_EXCLUDED_ANALYZERS =~ /mobsf/"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH && $SAST_DEFAULT_ANALYZERS =~ /mobsf/ && $SAST_EXPERIMENTAL_FEATURES
+      == 'true'"
+    :exists:
+    - "**/AndroidManifest.xml"
+  :variables:
+    :SEARCH_MAX_DEPTH: 4
+    :SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/mobsf:$SAST_ANALYZER_IMAGE_TAG"
+    :MOBSF_API_KEY: key
+  :script:
+  - "/analyzer run"
+  :extends: ".sast-analyzer"
+  :allow_failure: true
+  :services:
+  - :name: opensecurity/mobile-security-framework-mobsf:v3.3.3
+    :alias: mobsf
+  :image:
+    :name: "$SAST_ANALYZER_IMAGE"
+:mobsf-ios-sast:
+  :stage: test
+  :artifacts:
+    :reports:
+      :sast:
+      - gl-sast-report.json
+  :rules:
+  - :if: "$SAST_DISABLED"
+    :when: never
+  - :if: "$SAST_EXCLUDED_ANALYZERS =~ /mobsf/"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH && $SAST_DEFAULT_ANALYZERS =~ /mobsf/ && $SAST_EXPERIMENTAL_FEATURES
+      == 'true'"
+    :exists:
+    - "**/*.xcodeproj/*"
+  :variables:
+    :SEARCH_MAX_DEPTH: 4
+    :SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/mobsf:$SAST_ANALYZER_IMAGE_TAG"
+    :MOBSF_API_KEY: key
+  :script:
+  - "/analyzer run"
+  :extends: ".sast-analyzer"
+  :allow_failure: true
+  :services:
+  - :name: opensecurity/mobile-security-framework-mobsf:v3.3.3
+    :alias: mobsf
+  :image:
+    :name: "$SAST_ANALYZER_IMAGE"
+:nodejs-scan-sast:
+  :stage: test
+  :artifacts:
+    :reports:
+      :sast:
+      - gl-sast-report.json
+  :rules:
+  - :if: "$SAST_DISABLED"
+    :when: never
+  - :if: "$SAST_EXCLUDED_ANALYZERS =~ /nodejs-scan/"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH && $SAST_DEFAULT_ANALYZERS =~ /nodejs-scan/"
+    :exists:
+    - "**/package.json"
+  :variables:
+    :SEARCH_MAX_DEPTH: 4
+    :SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/nodejs-scan:$SAST_ANALYZER_IMAGE_TAG"
+  :script:
+  - "/analyzer run"
+  :extends: ".sast-analyzer"
+  :allow_failure: true
+  :image:
+    :name: "$SAST_ANALYZER_IMAGE"
+:phpcs-security-audit-sast:
+  :stage: test
+  :artifacts:
+    :reports:
+      :sast:
+      - gl-sast-report.json
+  :rules:
+  - :if: "$SAST_DISABLED"
+    :when: never
+  - :if: "$SAST_EXCLUDED_ANALYZERS =~ /phpcs-security-audit/"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH && $SAST_DEFAULT_ANALYZERS =~ /phpcs-security-audit/"
+    :exists:
+    - "**/*.php"
+  :variables:
+    :SEARCH_MAX_DEPTH: 4
+    :SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/phpcs-security-audit:$SAST_ANALYZER_IMAGE_TAG"
+  :script:
+  - "/analyzer run"
+  :extends: ".sast-analyzer"
+  :allow_failure: true
+  :image:
+    :name: "$SAST_ANALYZER_IMAGE"
+:pmd-apex-sast:
+  :stage: test
+  :artifacts:
+    :reports:
+      :sast:
+      - gl-sast-report.json
+  :rules:
+  - :if: "$SAST_DISABLED"
+    :when: never
+  - :if: "$SAST_EXCLUDED_ANALYZERS =~ /pmd-apex/"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH && $SAST_DEFAULT_ANALYZERS =~ /pmd-apex/"
+    :exists:
+    - "**/*.cls"
+  :variables:
+    :SEARCH_MAX_DEPTH: 4
+    :SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/pmd-apex:$SAST_ANALYZER_IMAGE_TAG"
+  :script:
+  - "/analyzer run"
+  :extends: ".sast-analyzer"
+  :allow_failure: true
+  :image:
+    :name: "$SAST_ANALYZER_IMAGE"
+:security-code-scan-sast:
+  :stage: test
+  :artifacts:
+    :reports:
+      :sast:
+      - gl-sast-report.json
+  :rules:
+  - :if: "$SAST_DISABLED"
+    :when: never
+  - :if: "$SAST_EXCLUDED_ANALYZERS =~ /security-code-scan/"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH && $SAST_DEFAULT_ANALYZERS =~ /security-code-scan/"
+    :exists:
+    - "**/*.csproj"
+    - "**/*.vbproj"
+  :variables:
+    :SEARCH_MAX_DEPTH: 4
+    :SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/security-code-scan:$SAST_ANALYZER_IMAGE_TAG"
+  :script:
+  - "/analyzer run"
+  :extends: ".sast-analyzer"
+  :allow_failure: true
+  :image:
+    :name: "$SAST_ANALYZER_IMAGE"
+:semgrep-sast:
+  :stage: test
+  :artifacts:
+    :reports:
+      :sast:
+      - gl-sast-report.json
+  :rules:
+  - :if: "$SAST_DISABLED"
+    :when: never
+  - :if: "$SAST_EXCLUDED_ANALYZERS =~ /semgrep/"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH && $SAST_DEFAULT_ANALYZERS =~ /semgrep/ && $SAST_EXPERIMENTAL_FEATURES
+      == 'true'"
+    :exists:
+    - "**/*.py"
+    - "**/*.js"
+    - "**/*.jsx"
+    - "**/*.ts"
+    - "**/*.tsx"
+  :variables:
+    :SEARCH_MAX_DEPTH: 4
+    :SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/semgrep:latest"
+  :script:
+  - "/analyzer run"
+  :extends: ".sast-analyzer"
+  :allow_failure: true
+  :image:
+    :name: "$SAST_ANALYZER_IMAGE"
+:sobelow-sast:
+  :stage: test
+  :artifacts:
+    :reports:
+      :sast:
+      - gl-sast-report.json
+  :rules:
+  - :if: "$SAST_DISABLED"
+    :when: never
+  - :if: "$SAST_EXCLUDED_ANALYZERS =~ /sobelow/"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH && $SAST_DEFAULT_ANALYZERS =~ /sobelow/"
+    :exists:
+    - mix.exs
+  :variables:
+    :SEARCH_MAX_DEPTH: 4
+    :SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/sobelow:$SAST_ANALYZER_IMAGE_TAG"
+  :script:
+  - "/analyzer run"
+  :extends: ".sast-analyzer"
+  :allow_failure: true
+  :image:
+    :name: "$SAST_ANALYZER_IMAGE"
+:spotbugs-sast:
+  :stage: test
+  :artifacts:
+    :reports:
+      :sast:
+      - gl-sast-report.json
+  :rules:
+  - :if: "$SAST_EXCLUDED_ANALYZERS =~ /spotbugs/"
+    :when: never
+  - :if: "$SAST_DEFAULT_ANALYZERS =~ /mobsf/ && $SAST_EXPERIMENTAL_FEATURES == 'true'"
+    :exists:
+    - "**/AndroidManifest.xml"
+    :when: never
+  - :if: "$SAST_DISABLED"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH && $SAST_DEFAULT_ANALYZERS =~ /spotbugs/"
+    :exists:
+    - "**/*.groovy"
+    - "**/*.java"
+    - "**/*.scala"
+  :variables:
+    :SEARCH_MAX_DEPTH: 4
+    :SAST_ANALYZER_IMAGE: "$SECURE_ANALYZERS_PREFIX/spotbugs:$SAST_ANALYZER_IMAGE_TAG"
+  :script:
+  - "/analyzer run"
+  :extends: ".sast-analyzer"
+  :allow_failure: true
+  :image:
+    :name: "$SAST_ANALYZER_IMAGE"
+:.secret-analyzer:
+  :stage: test
+  :image: "$SECURE_ANALYZERS_PREFIX/secrets:$SECRETS_ANALYZER_VERSION"
+  :services: []
+  :allow_failure: true
+  :artifacts:
+    :reports:
+      :secret_detection: gl-secret-detection-report.json
+:secret_detection_default_branch:
+  :stage: test
+  :image: "$SECURE_ANALYZERS_PREFIX/secrets:$SECRETS_ANALYZER_VERSION"
+  :services: []
+  :allow_failure: true
+  :artifacts:
+    :reports:
+      :secret_detection:
+      - gl-secret-detection-report.json
+  :extends: ".secret-analyzer"
+  :rules:
+  - :if: "$SECRET_DETECTION_DISABLED"
+    :when: never
+  - :if: "$CI_DEFAULT_BRANCH == $CI_COMMIT_BRANCH"
+  :script:
+  - "/analyzer run"
+:secret_detection:
+  :stage: test
+  :image: "$SECURE_ANALYZERS_PREFIX/secrets:$SECRETS_ANALYZER_VERSION"
+  :services: []
+  :allow_failure: true
+  :artifacts:
+    :reports:
+      :secret_detection:
+      - gl-secret-detection-report.json
+  :extends: ".secret-analyzer"
+  :rules:
+  - :if: "$SECRET_DETECTION_DISABLED"
+    :when: never
+  - :if: "$CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH"
+  :script:
+  - if [[ $CI_COMMIT_TAG ]]; then echo "Skipping Secret Detection for tags. No code
+    changes have occurred."; exit 0; fi
+  - git fetch origin $CI_DEFAULT_BRANCH $CI_COMMIT_REF_NAME
+  - git log --left-right --cherry-pick --pretty=format:"%H" refs/remotes/origin/$CI_DEFAULT_BRANCH...refs/remotes/origin/$CI_COMMIT_REF_NAME
+    > "$CI_COMMIT_SHA"_commit_list.txt
+  - export SECRET_DETECTION_COMMITS_FILE="$CI_COMMIT_SHA"_commit_list.txt
+  - "/analyzer run"
+  - rm "$CI_COMMIT_SHA"_commit_list.txt
+:image: alpine:latest
+:workflow:
+  :rules:
+  - :if: $BUILDPACK_URL || $AUTO_DEVOPS_EXPLICITLY_ENABLED == "1" || $DOCKERFILE_PATH
+  - :exists:
+    - Dockerfile
+  - :exists:
+    - project.clj
+  - :exists:
+    - go.mod
+    - Gopkg.mod
+    - Godeps/Godeps.json
+    - vendor/vendor.json
+    - glide.yaml
+    - src/**/*.go
+  - :exists:
+    - gradlew
+    - build.gradle
+    - settings.gradle
+  - :exists:
+    - pom.xml
+    - pom.atom
+    - pom.clj
+    - pom.groovy
+    - pom.rb
+    - pom.scala
+    - pom.yaml
+    - pom.yml
+  - :exists:
+    - ".buildpacks"
+  - :exists:
+    - package.json
+  - :exists:
+    - composer.json
+    - index.php
+  - :exists:
+    - "**/conf/application.conf"
+  - :exists:
+    - requirements.txt
+    - setup.py
+    - Pipfile
+  - :exists:
+    - Gemfile
+  - :exists:
+    - "*.sbt"
+    - project/*.scala
+    - ".sbt/*.scala"
+    - project/build.properties
+  - :exists:
+    - ".static"
